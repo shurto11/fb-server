@@ -1,0 +1,31 @@
+# fb-server のシーン定義サンプル。
+# ~/.config/fb-server/scenes.toml にコピーして使う(README 参照)。
+#
+# - `default`: どの排他シーンも有効でないときのレイヤー一覧
+# - `[scenes.X]`: `X` という名前で hello したクライアントが接続している間、
+#   このシーンが有効になる(切断で自動的に default、または他に接続中の
+#   シーンへ戻る)
+#   - `extends + add`: 指定シーンのレイヤー一覧に追加する
+#   - `layers`: レイヤー一覧を完全に指定する(継承しない)
+# - `"status-bar"` は実クライアントではない特殊レイヤー名。fb-server が
+#   自分でシーンのレイヤー一覧を見て `tmux set -g status on/off` を行う。
+
+default = ["status-bar", "task-var", "touch-claude", "spotatui-pip"]
+
+[scenes.ssbrowse]
+extends = "default"
+add = ["ssbrowse"]
+
+[scenes.fbhalf]
+extends = "default"
+add = ["fbhalf"]
+
+[scenes.dopagaki]
+extends = "default"
+add = ["dopagaki"]
+
+[scenes.touch-paint]
+layers = ["status-bar", "task-var", "touch-paint"]
+
+[scenes.tmux-session]
+layers = ["tmux-session"]
