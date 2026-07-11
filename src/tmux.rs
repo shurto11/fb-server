@@ -155,7 +155,6 @@ pub fn run(extra: &[&str]) {
 }
 
 /// tmux を実行し標準出力を返す。失敗時は空文字列。
-#[allow(dead_code)]
 pub fn capture(extra: &[&str]) -> String {
     let full = full_args(extra);
     match Command::new("tmux").args(&full).output() {

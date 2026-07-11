@@ -33,7 +33,7 @@ fn status() -> Result<()> {
     let path = socket_path();
     let stream = UnixStream::connect(&path)
         .with_context(|| format!("fb-server に接続できません ({path})"))?;
-    let hello = Hello { hello: STATUS_QUERY_NAME.to_string() };
+    let hello = Hello { hello: STATUS_QUERY_NAME.to_string(), session: None };
     let mut line = serde_json::to_string(&hello)?;
     line.push('\n');
     (&stream).write_all(line.as_bytes())?;
@@ -44,6 +44,9 @@ fn status() -> Result<()> {
     let reply: StatusReply = serde_json::from_str(resp.trim())?;
 
     println!("scene: {}", reply.scene);
+    if let Some(s) = &reply.active_session {
+        println!("active tmux session: {s}");
+    }
     if reply.clients.is_empty() {
         println!("clients: (none)");
     } else {

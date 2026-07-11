@@ -35,8 +35,25 @@ fb-server serve (デーモン)
 - ソケット: `$XDG_RUNTIME_DIR/fb-server.sock`(無ければ `/tmp/fb-server.sock`)。
   `FB_SERVER_SOCK` で上書き可。
 - クライアント→サーバー(接続直後・1行): `{"hello":"task-var"}`
+  - 任意で tmux セッションIDを申告できる: `{"hello":"ssbrowse","session":"$3"}`
 - サーバー→クライアント: `{"visible":true}` / `{"visible":false}`
-  (接続直後に1回、以降シーンが変わるたびに配信)
+  (接続直後に1回、以降シーンやアクティブセッションが変わるたびに配信)
+  - セッション不一致による非表示は `{"visible":false,"reason":"session"}`
+
+## セッション拘束 (tmux セッション単位の表示制御)
+
+`hello` に `session`(tmux の `#{session_id}`、`$0` 形式)を含めたクライアントは、
+シーンによる許可に加えて「その tmux セッションが今表示されているか」の AND で
+visible が決まる。ssbrowse のスクリーンショットを起動したセッションでだけ
+表示し、別セッションへ切り替えたら隠す、という用途に使う。
+
+- fb-server はセッション拘束クライアントが接続している間だけ、500ms ごとに
+  `tmux list-clients` でアクティブセッション(複数クライアント時は最後に操作
+  されたもの)をポーリングし、切り替わりを検知したら visible を再配信する
+- セッション不一致による非表示は `reason:"session"` 付きで通知される。
+  クライアントは領域クリア後に `tmux refresh-client` でターミナルの文字を
+  復元してよい(シーン由来の非表示では全画面アプリの描画を壊すため不可)
+- tmux に到達できない環境ではセッション拘束は適用されない(フェイルオープン)
 
 ## シーン定義 (scenes.toml)
 
