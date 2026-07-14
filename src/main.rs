@@ -33,7 +33,7 @@ fn status() -> Result<()> {
     let path = socket_path();
     let stream = UnixStream::connect(&path)
         .with_context(|| format!("fb-server に接続できません ({path})"))?;
-    let hello = Hello { hello: STATUS_QUERY_NAME.to_string(), session: None };
+    let hello = Hello { hello: STATUS_QUERY_NAME.to_string(), session: None, rect: None };
     let mut line = serde_json::to_string(&hello)?;
     line.push('\n');
     (&stream).write_all(line.as_bytes())?;

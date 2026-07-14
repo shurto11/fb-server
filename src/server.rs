@@ -5,8 +5,12 @@
 //! セッションがアクティブな間だけ visible=true になる(シーン許可との AND)。
 //! アクティブセッションはセッション拘束クライアントが居る間だけ tmux を
 //! ポーリングして追跡する。
+//!
+//! hello で描画領域 (`rect`) を申告したクライアント同士は重なりを調停する:
+//! シーンのレイヤー一覧の並びが優先度(先頭が最上位)で、優先度の高い表示中
+//! クライアントと矩形が重なる下位クライアントは visible=false(occluded)になる。
 
-use crate::protocol::{socket_path, Hello, StatusReply, Visible, STATUS_QUERY_NAME};
+use crate::protocol::{socket_path, Hello, Rect, StatusReply, Visible, STATUS_QUERY_NAME};
 use crate::scenes::Config;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -22,6 +26,8 @@ struct Client {
     name: String,
     /// hello で申告された tmux セッションID(`$0` 形式)。None なら無条件。
     session: Option<String>,
+    /// hello で申告された描画領域。None なら重なり調停に参加しない。
+    rect: Option<Rect>,
     write: UnixStream,
 }
 
@@ -119,6 +125,62 @@ fn current_scene(reg: &[Client], config: &Config) -> String {
         .unwrap_or_else(|| "default".to_string())
 }
 
+/// visible 判定に使うクライアント情報(`Client` から UnixStream を除いたもの)。
+struct LayerInfo<'a> {
+    id: u64,
+    name: &'a str,
+    session: Option<&'a str>,
+    rect: Option<Rect>,
+}
+
+/// 全クライアントの visible を計算する。`infos` と同じ順で返す。
+///
+/// 判定は3段の AND:
+/// 1. シーン許可: 名前が `layers` に含まれるか
+/// 2. セッション拘束: 申告セッションがアクティブセッションと一致するか
+///    (どちらかが不明なら適用しない = フェイルオープン)
+/// 3. 重なり調停: `layers` の並びを優先度(先頭が最上位)とし、rect を申告した
+///    クライアントは、自分より優先度が高く実際に表示中のクライアントの rect と
+///    重なる間 `reason:"occluded"` で隠される。同名クライアント同士は後着が上。
+///    隠されたクライアントは描画しないので、さらに下のレイヤーは隠さない。
+fn compute_visibility(infos: &[LayerInfo], layers: &[String], active: Option<&str>) -> Vec<Visible> {
+    let layer_index = |name: &str| layers.iter().position(|l| l == name);
+    let mut order: Vec<usize> = (0..infos.len()).collect();
+    order.sort_by_key(|&i| {
+        (layer_index(infos[i].name).unwrap_or(usize::MAX), std::cmp::Reverse(infos[i].id))
+    });
+
+    let mut out = vec![Visible { visible: false, reason: None }; infos.len()];
+    let mut shown_rects: Vec<Rect> = Vec::new();
+    for &i in &order {
+        let c = &infos[i];
+        let in_scene = layer_index(c.name).is_some();
+        // active_session が取れない間 (tmux 不在等) はセッション拘束を適用しない
+        let session_ok = match (c.session, active) {
+            (Some(cs), Some(a)) => cs == a,
+            _ => true,
+        };
+        let occluded = in_scene
+            && session_ok
+            && c.rect.is_some_and(|r| shown_rects.iter().any(|s| s.overlaps(&r)));
+        let visible = in_scene && session_ok && !occluded;
+        if visible {
+            if let Some(r) = c.rect {
+                shown_rects.push(r);
+            }
+        }
+        let reason = if in_scene && !session_ok {
+            Some("session".to_string())
+        } else if occluded {
+            Some("occluded".to_string())
+        } else {
+            None
+        };
+        out[i] = Visible { visible, reason };
+    }
+    out
+}
+
 /// レジストリの現在状態から visible を再計算し、全クライアントへ配信する。
 /// あわせて `status-bar` レイヤーの有無に応じて tmux のステータス行を切り替える。
 fn recompute_and_broadcast(shared: &Shared, config: &Config) {
@@ -126,30 +188,29 @@ fn recompute_and_broadcast(shared: &Shared, config: &Config) {
     let active = shared.active_session.lock().unwrap().clone();
     let scene = current_scene(&reg, config);
     let layers = config.layers_for(&scene);
-    let layer_set: HashSet<&str> = layers.iter().map(|s| s.as_str()).collect();
 
     eprintln!(
         "[fb-server] scene={scene} layers={layers:?} active_session={active:?} clients={:?}",
         reg.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()
     );
 
-    for c in reg.iter() {
-        let in_scene = layer_set.contains(c.name.as_str());
-        // active_session が取れない間 (tmux 不在等) はセッション拘束を適用しない
-        let session_ok = match (&c.session, &active) {
-            (Some(cs), Some(a)) => cs == a,
-            _ => true,
-        };
-        let visible = Visible {
-            visible: in_scene && session_ok,
-            reason: (in_scene && !session_ok).then(|| "session".to_string()),
-        };
-        let mut line = serde_json::to_string(&visible).unwrap_or_default();
+    let infos: Vec<LayerInfo> = reg
+        .iter()
+        .map(|c| LayerInfo {
+            id: c.id,
+            name: c.name.as_str(),
+            session: c.session.as_deref(),
+            rect: c.rect,
+        })
+        .collect();
+    let visibles = compute_visibility(&infos, layers, active.as_deref());
+    for (c, visible) in reg.iter().zip(&visibles) {
+        let mut line = serde_json::to_string(visible).unwrap_or_default();
         line.push('\n');
         let _ = (&c.write).write_all(line.as_bytes());
     }
 
-    let status_on = layer_set.contains("status-bar");
+    let status_on = layers.iter().any(|l| l == "status-bar");
     crate::tmux::run(&["set", "-g", "status", if status_on { "on" } else { "off" }]);
 }
 
@@ -177,9 +238,15 @@ fn handle_client(id: u64, stream: UnixStream, shared: Arc<Shared>, config: Arc<C
         let scene = current_scene(&reg, &config);
         let clients = reg
             .iter()
-            .map(|c| match &c.session {
-                Some(s) => format!("{} (session {s})", c.name),
-                None => c.name.clone(),
+            .map(|c| {
+                let mut s = c.name.clone();
+                if let Some(sess) = &c.session {
+                    s.push_str(&format!(" (session {sess})"));
+                }
+                if let Some(r) = &c.rect {
+                    s.push_str(&format!(" [{}x{}+{}+{}]", r.w, r.h, r.x, r.y));
+                }
+                s
             })
             .collect();
         drop(reg);
@@ -192,14 +259,15 @@ fn handle_client(id: u64, stream: UnixStream, shared: Arc<Shared>, config: Arc<C
     }
 
     eprintln!(
-        "[fb-server] + client #{id} name={} session={:?}",
-        hello.hello, hello.session
+        "[fb-server] + client #{id} name={} session={:?} rect={:?}",
+        hello.hello, hello.session, hello.rect
     );
     let bound = hello.session.is_some();
     shared.clients.lock().unwrap().push(Client {
         id,
         name: hello.hello.clone(),
         session: hello.session,
+        rect: hello.rect,
         write: stream,
     });
     // セッション拘束クライアントの初回判定をポーリングを待たずに行う
@@ -220,4 +288,120 @@ fn handle_client(id: u64, stream: UnixStream, shared: Arc<Shared>, config: Arc<C
     shared.clients.lock().unwrap().retain(|c| c.id != id);
     eprintln!("[fb-server] - client #{id} ({})", hello.hello);
     recompute_and_broadcast(&shared, &config);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(x: u32, y: u32, w: u32, h: u32) -> Option<Rect> {
+        Some(Rect { x, y, w, h })
+    }
+
+    fn layers(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn info(id: u64, name: &str, rect: Option<Rect>) -> LayerInfo<'_> {
+        LayerInfo { id, name, session: None, rect }
+    }
+
+    #[test]
+    fn overlap_hides_lower_priority_layer() {
+        let layers = layers(&["task-var", "spotatui-pip"]);
+        let infos = vec![
+            info(1, "spotatui-pip", rect(0, 0, 100, 100)),
+            info(2, "task-var", rect(50, 50, 100, 100)),
+        ];
+        let v = compute_visibility(&infos, &layers, None);
+        // task-var が配列の先頭 = 優先度が高いので、重なった spotatui-pip が隠れる
+        assert!(!v[0].visible);
+        assert_eq!(v[0].reason.as_deref(), Some("occluded"));
+        assert!(v[1].visible);
+    }
+
+    #[test]
+    fn disjoint_rects_are_both_visible() {
+        let layers = layers(&["task-var", "spotatui-pip"]);
+        let infos = vec![
+            info(1, "spotatui-pip", rect(0, 0, 50, 50)),
+            info(2, "task-var", rect(50, 50, 50, 50)),
+        ];
+        let v = compute_visibility(&infos, &layers, None);
+        assert!(v[0].visible && v[1].visible);
+    }
+
+    #[test]
+    fn client_without_rect_does_not_participate() {
+        let layers = layers(&["task-var", "spotatui-pip"]);
+        let infos = vec![
+            info(1, "spotatui-pip", None),
+            info(2, "task-var", rect(0, 0, 100, 100)),
+        ];
+        let v = compute_visibility(&infos, &layers, None);
+        assert!(v[0].visible && v[1].visible);
+    }
+
+    #[test]
+    fn occluded_layer_does_not_occlude_layers_below() {
+        // 上位A が 中位B を隠しても、B と重なるだけの下位C は隠れない
+        let layers = layers(&["a", "b", "c"]);
+        let infos = vec![
+            info(1, "a", rect(0, 0, 10, 10)),
+            info(2, "b", rect(5, 5, 10, 10)),
+            info(3, "c", rect(10, 10, 10, 10)),
+        ];
+        let v = compute_visibility(&infos, &layers, None);
+        assert!(v[0].visible);
+        assert!(!v[1].visible);
+        assert!(v[2].visible, "b は隠れているので c を隠せない");
+    }
+
+    #[test]
+    fn out_of_scene_layer_never_occludes() {
+        let layers = layers(&["b"]);
+        let infos = vec![
+            info(1, "a", rect(0, 0, 100, 100)),
+            info(2, "b", rect(0, 0, 100, 100)),
+        ];
+        let v = compute_visibility(&infos, &layers, None);
+        assert!(!v[0].visible);
+        assert_eq!(v[0].reason, None, "シーン外の非表示に reason は付かない");
+        assert!(v[1].visible);
+    }
+
+    #[test]
+    fn session_mismatch_takes_precedence_over_occlusion() {
+        let layers = layers(&["a", "b"]);
+        let mut b = info(2, "b", rect(0, 0, 10, 10));
+        b.session = Some("$1");
+        let infos = vec![info(1, "a", rect(0, 0, 10, 10)), b];
+        let v = compute_visibility(&infos, &layers, Some("$0"));
+        assert!(v[0].visible);
+        assert!(!v[1].visible);
+        assert_eq!(v[1].reason.as_deref(), Some("session"));
+    }
+
+    #[test]
+    fn same_name_later_connection_wins() {
+        let layers = layers(&["a"]);
+        let infos = vec![
+            info(1, "a", rect(0, 0, 10, 10)),
+            info(2, "a", rect(0, 0, 10, 10)),
+        ];
+        let v = compute_visibility(&infos, &layers, None);
+        assert!(!v[0].visible);
+        assert!(v[1].visible, "同名レイヤーは後着が上");
+    }
+
+    #[test]
+    fn rect_edge_touching_is_not_overlap() {
+        let a = Rect { x: 0, y: 0, w: 50, h: 50 };
+        let b = Rect { x: 50, y: 0, w: 50, h: 50 };
+        assert!(!a.overlaps(&b));
+        let c = Rect { x: 49, y: 49, w: 50, h: 50 };
+        assert!(a.overlaps(&c));
+        let zero = Rect { x: 0, y: 0, w: 0, h: 0 };
+        assert!(!a.overlaps(&zero));
+    }
 }

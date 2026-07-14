@@ -9,6 +9,11 @@
 #   - `layers`: レイヤー一覧を完全に指定する(継承しない)
 # - `"status-bar"` は実クライアントではない特殊レイヤー名。fb-server が
 #   自分でシーンのレイヤー一覧を見て `tmux set -g status on/off` を行う。
+#
+# レイヤー一覧の並びは表示の優先順位(先頭が最上位)。hello で rect(描画領域)
+# を申告したクライアントは、より前のレイヤーの表示中クライアントと矩形が
+# 重なる間 visible=false(occluded)になる。`extends + add` の追加分は末尾に
+# 付くので、追加レイヤーは継承元より優先度が低くなる点に注意。
 
 default = ["status-bar", "task-var", "touch-claude", "spotatui-pip"]
 
