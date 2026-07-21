@@ -68,6 +68,16 @@ pub struct Visible {
     pub clip: Vec<Rect>,
 }
 
+/// クライアント → サーバー(hello の後、描画領域が変わるたびに1行送ってよい)。
+/// 現在の描画領域を申告し直す。`rect` を省略/null にすると領域申告を取り消す
+/// (以降は調停対象外)。auto 追従で描画領域が動くクライアント(fbhalf など)が
+/// 使う。hello 後にこれ以外の入力を送らないクライアントは影響を受けない。
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RectUpdate {
+    #[serde(default)]
+    pub rect: Option<Rect>,
+}
+
 /// `fb-server status` 用の予約済みクライアント名。
 /// この名前で hello すると通常のレイヤー登録は行わず、現在のシーン名と
 /// 接続中クライアント一覧を1行返して切断する。

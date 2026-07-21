@@ -12,7 +12,9 @@
 //! `clip`(描画禁止矩形)として配られる。下位はその矩形を避けて描くので、
 //! 領域全体を隠さずに交互上書き(チカチカ)だけを防げる。
 
-use crate::protocol::{socket_path, Hello, Rect, StatusReply, Visible, STATUS_QUERY_NAME};
+use crate::protocol::{
+    socket_path, Hello, Rect, RectUpdate, StatusReply, Visible, STATUS_QUERY_NAME,
+};
 use crate::scenes::Config;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -282,12 +284,30 @@ fn handle_client(id: u64, stream: UnixStream, shared: Arc<Shared>, config: Arc<C
     }
     recompute_and_broadcast(&shared, &config);
 
-    // 以降は読み続けるだけ。EOF/エラーで切断とみなし登録解除する。
+    // 以降は rect 更新を受け付ける。EOF/エラーで切断とみなし登録解除する。
+    // rect 以外を送らないクライアントは、この分岐に入らず EOF まで待つだけ。
     loop {
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) | Err(_) => break,
-            Ok(_) => {}
+            Ok(_) => {
+                let Ok(upd) = serde_json::from_str::<RectUpdate>(line.trim()) else {
+                    continue;
+                };
+                let changed = {
+                    let mut reg = shared.clients.lock().unwrap();
+                    match reg.iter_mut().find(|c| c.id == id) {
+                        Some(c) if c.rect != upd.rect => {
+                            c.rect = upd.rect;
+                            true
+                        }
+                        _ => false,
+                    }
+                };
+                if changed {
+                    recompute_and_broadcast(&shared, &config);
+                }
+            }
         }
     }
     shared.clients.lock().unwrap().retain(|c| c.id != id);

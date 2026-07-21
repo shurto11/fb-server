@@ -38,6 +38,9 @@ fb-server serve (デーモン)
   - 任意で tmux セッションIDを申告できる: `{"hello":"ssbrowse","session":"$3"}`
   - 任意で描画領域(ピクセル座標)を申告できる:
     `{"hello":"spotatui-pip","rect":{"x":800,"y":0,"w":224,"h":126}}`
+  - 描画領域が動くクライアント(fbhalf の auto 追従など)は、hello の後で
+    領域が変わるたびに `{"rect":{"x":0,"y":0,"w":512,"h":768}}` を1行送って
+    申告し直せる(`{"rect":null}` で取り消し)。送らないクライアントは無影響
 - サーバー→クライアント: `{"visible":true}` / `{"visible":false}`
   (接続直後に1回、以降シーンやアクティブセッション、重なり状況が変わるたびに配信)
   - セッション不一致による非表示は `{"visible":false,"reason":"session"}`
