@@ -16,8 +16,9 @@ use serde::{Deserialize, Serialize};
 ///
 /// `rect` は任意の描画領域(フレームバッファ上のピクセル座標)。申告すると
 /// 重なり調停の対象になる: シーンのレイヤー一覧で自分より前(= 優先度が高い)
-/// の表示中クライアントと矩形が重なる間、visible=false(reason:"occluded")に
-/// なる。未申告のクライアントは調停に参加しない(隠されも隠しもしない)。
+/// の表示中クライアントと矩形が重なると、その重なり領域が `clip`(描画禁止
+/// 矩形)として通知される。クライアントはその矩形を避けて描画すればチカチカ
+/// しない。未申告のクライアントは調停に参加しない(隠しも隠されもしない)。
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Hello {
     pub hello: String,
@@ -37,26 +38,34 @@ pub struct Rect {
 }
 
 impl Rect {
-    /// 2つの矩形が1ピクセルでも重なるか。幅/高さ 0 は何とも重ならない。
-    pub fn overlaps(&self, other: &Rect) -> bool {
-        self.x < other.x + other.w
-            && other.x < self.x + self.w
-            && self.y < other.y + other.h
-            && other.y < self.y + self.h
+    /// 2つの矩形の重なり部分。重ならなければ None(幅/高さ 0 や辺が接する
+    /// だけの場合も含む)。
+    pub fn intersect(&self, other: &Rect) -> Option<Rect> {
+        let x0 = self.x.max(other.x);
+        let y0 = self.y.max(other.y);
+        let x1 = (self.x + self.w).min(other.x + other.w);
+        let y1 = (self.y + self.h).min(other.y + other.h);
+        (x1 > x0 && y1 > y0).then(|| Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 })
     }
 }
 
 /// サーバー → クライアント。今表示してよいか。
 /// `reason` は visible=false の理由。`"session"` はシーン上は許可されている
 /// がセッション不一致で隠された場合(クライアントはクリア後にターミナルの
-/// 再描画を要求してよい)。`"occluded"` はシーン上は許可されているが、より
-/// 優先度の高いレイヤーと描画領域(rect)が重なって隠された場合。
-/// それ以外(シーンによる非許可)では省略される。
+/// 再描画を要求してよい)。それ以外(シーンによる非許可)では省略される。
+///
+/// `clip` は描画禁止矩形のリスト(フレームバッファ絶対座標)。自分より優先度が
+/// 高い表示中クライアントが占める、自分の rect と重なる領域。visible=true でも
+/// この矩形の内側は描いてはならない(上位レイヤーが描く領域なので、描くと
+/// 交互上書きでチカチカする)。空なら全面を描いてよい。rect を申告していない
+/// クライアントには常に空。
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Visible {
     pub visible: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clip: Vec<Rect>,
 }
 
 /// `fb-server status` 用の予約済みクライアント名。

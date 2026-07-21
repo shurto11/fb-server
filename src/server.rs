@@ -8,7 +8,9 @@
 //!
 //! hello で描画領域 (`rect`) を申告したクライアント同士は重なりを調停する:
 //! シーンのレイヤー一覧の並びが優先度(先頭が最上位)で、優先度の高い表示中
-//! クライアントと矩形が重なる下位クライアントは visible=false(occluded)になる。
+//! クライアントと矩形が重なる下位クライアントには、その重なり領域が
+//! `clip`(描画禁止矩形)として配られる。下位はその矩形を避けて描くので、
+//! 領域全体を隠さずに交互上書き(チカチカ)だけを防げる。
 
 use crate::protocol::{socket_path, Hello, Rect, StatusReply, Visible, STATUS_QUERY_NAME};
 use crate::scenes::Config;
@@ -135,14 +137,16 @@ struct LayerInfo<'a> {
 
 /// 全クライアントの visible を計算する。`infos` と同じ順で返す。
 ///
-/// 判定は3段の AND:
-/// 1. シーン許可: 名前が `layers` に含まれるか
+/// 判定:
+/// 1. シーン許可: 名前が `layers` に含まれるか。無ければ visible=false。
 /// 2. セッション拘束: 申告セッションがアクティブセッションと一致するか
-///    (どちらかが不明なら適用しない = フェイルオープン)
-/// 3. 重なり調停: `layers` の並びを優先度(先頭が最上位)とし、rect を申告した
-///    クライアントは、自分より優先度が高く実際に表示中のクライアントの rect と
-///    重なる間 `reason:"occluded"` で隠される。同名クライアント同士は後着が上。
-///    隠されたクライアントは描画しないので、さらに下のレイヤーは隠さない。
+///    (どちらかが不明なら適用しない = フェイルオープン)。不一致なら
+///    visible=false, reason="session"。
+/// 3. 重なり調停(クリップ): `layers` の並びを優先度(先頭が最上位)とし、rect を
+///    申告したクライアントは visible=true のまま、自分より優先度が高い表示中
+///    クライアントの rect と重なる領域を `clip`(描画禁止矩形)として受け取る。
+///    クライアントはその矩形を避けて描くのでチカチカしない。同名クライアント
+///    同士は後着が上。rect 未申告のクライアントは調停に参加しない(clip 空)。
 fn compute_visibility(infos: &[LayerInfo], layers: &[String], active: Option<&str>) -> Vec<Visible> {
     let layer_index = |name: &str| layers.iter().position(|l| l == name);
     let mut order: Vec<usize> = (0..infos.len()).collect();
@@ -150,8 +154,10 @@ fn compute_visibility(infos: &[LayerInfo], layers: &[String], active: Option<&st
         (layer_index(infos[i].name).unwrap_or(usize::MAX), std::cmp::Reverse(infos[i].id))
     });
 
-    let mut out = vec![Visible { visible: false, reason: None }; infos.len()];
-    let mut shown_rects: Vec<Rect> = Vec::new();
+    let mut out = vec![Visible { visible: false, reason: None, clip: Vec::new() }; infos.len()];
+    // 優先度が高い順に処理し、表示中クライアントの rect を積んでいく。
+    // 下位クライアントはこの矩形群との重なりを clip として受け取る。
+    let mut occluders: Vec<Rect> = Vec::new();
     for &i in &order {
         let c = &infos[i];
         let in_scene = layer_index(c.name).is_some();
@@ -160,23 +166,22 @@ fn compute_visibility(infos: &[LayerInfo], layers: &[String], active: Option<&st
             (Some(cs), Some(a)) => cs == a,
             _ => true,
         };
-        let occluded = in_scene
-            && session_ok
-            && c.rect.is_some_and(|r| shown_rects.iter().any(|s| s.overlaps(&r)));
-        let visible = in_scene && session_ok && !occluded;
-        if visible {
-            if let Some(r) = c.rect {
-                shown_rects.push(r);
-            }
+        if !in_scene {
+            out[i] = Visible { visible: false, reason: None, clip: Vec::new() };
+            continue;
         }
-        let reason = if in_scene && !session_ok {
-            Some("session".to_string())
-        } else if occluded {
-            Some("occluded".to_string())
-        } else {
-            None
+        if !session_ok {
+            out[i] = Visible { visible: false, reason: Some("session".to_string()), clip: Vec::new() };
+            continue;
+        }
+        let clip: Vec<Rect> = match c.rect {
+            Some(r) => occluders.iter().filter_map(|o| o.intersect(&r)).collect(),
+            None => Vec::new(),
         };
-        out[i] = Visible { visible, reason };
+        out[i] = Visible { visible: true, reason: None, clip };
+        if let Some(r) = c.rect {
+            occluders.push(r);
+        }
     }
     out
 }
@@ -306,102 +311,127 @@ mod tests {
         LayerInfo { id, name, session: None, rect }
     }
 
+    fn r(x: u32, y: u32, w: u32, h: u32) -> Rect {
+        Rect { x, y, w, h }
+    }
+
     #[test]
-    fn overlap_hides_lower_priority_layer() {
+    fn overlap_clips_lower_priority_layer() {
         let layers = layers(&["task-var", "spotatui-pip"]);
         let infos = vec![
             info(1, "spotatui-pip", rect(0, 0, 100, 100)),
             info(2, "task-var", rect(50, 50, 100, 100)),
         ];
         let v = compute_visibility(&infos, &layers, None);
-        // task-var が配列の先頭 = 優先度が高いので、重なった spotatui-pip が隠れる
-        assert!(!v[0].visible);
-        assert_eq!(v[0].reason.as_deref(), Some("occluded"));
+        // task-var が配列の先頭 = 優先度が高い。下位 spotatui-pip は消えず、
+        // 重なり領域 (50,50)-(100,100) を clip として受け取る。
+        assert!(v[0].visible);
+        assert_eq!(v[0].clip, vec![r(50, 50, 50, 50)]);
         assert!(v[1].visible);
+        assert!(v[1].clip.is_empty(), "最上位に clip は付かない");
     }
 
     #[test]
-    fn disjoint_rects_are_both_visible() {
+    fn disjoint_rects_get_no_clip() {
         let layers = layers(&["task-var", "spotatui-pip"]);
         let infos = vec![
             info(1, "spotatui-pip", rect(0, 0, 50, 50)),
             info(2, "task-var", rect(50, 50, 50, 50)),
         ];
         let v = compute_visibility(&infos, &layers, None);
-        assert!(v[0].visible && v[1].visible);
+        assert!(v[0].visible && v[0].clip.is_empty());
+        assert!(v[1].visible && v[1].clip.is_empty());
     }
 
     #[test]
     fn client_without_rect_does_not_participate() {
         let layers = layers(&["task-var", "spotatui-pip"]);
         let infos = vec![
+            // 下位が rect 未申告 → clip を受け取らない
             info(1, "spotatui-pip", None),
             info(2, "task-var", rect(0, 0, 100, 100)),
         ];
         let v = compute_visibility(&infos, &layers, None);
-        assert!(v[0].visible && v[1].visible);
+        assert!(v[0].visible && v[0].clip.is_empty());
+        assert!(v[1].visible && v[1].clip.is_empty());
     }
 
     #[test]
-    fn occluded_layer_does_not_occlude_layers_below() {
-        // 上位A が 中位B を隠しても、B と重なるだけの下位C は隠れない
-        let layers = layers(&["a", "b", "c"]);
+    fn rectless_upper_layer_does_not_clip_lower() {
+        // 上位が rect 未申告なら occluder にならず、下位は clip を受けない
+        let layers = layers(&["task-var", "spotatui-pip"]);
         let infos = vec![
-            info(1, "a", rect(0, 0, 10, 10)),
-            info(2, "b", rect(5, 5, 10, 10)),
-            info(3, "c", rect(10, 10, 10, 10)),
+            info(1, "spotatui-pip", rect(0, 0, 100, 100)),
+            info(2, "task-var", None),
         ];
         let v = compute_visibility(&infos, &layers, None);
-        assert!(v[0].visible);
-        assert!(!v[1].visible);
-        assert!(v[2].visible, "b は隠れているので c を隠せない");
+        assert!(v[0].visible && v[0].clip.is_empty());
     }
 
     #[test]
-    fn out_of_scene_layer_never_occludes() {
+    fn clip_accumulates_from_all_higher_layers() {
+        // 下位 c は上位 a, b 双方と重なるので clip を2つ受け取る
+        let layers = layers(&["a", "b", "c"]);
+        let infos = vec![
+            info(1, "a", rect(0, 0, 20, 20)),
+            info(2, "b", rect(80, 0, 20, 20)),
+            info(3, "c", rect(0, 0, 100, 20)),
+        ];
+        let v = compute_visibility(&infos, &layers, None);
+        assert!(v[2].visible);
+        assert_eq!(v[2].clip.len(), 2);
+        assert!(v[2].clip.contains(&r(0, 0, 20, 20)));
+        assert!(v[2].clip.contains(&r(80, 0, 20, 20)));
+    }
+
+    #[test]
+    fn out_of_scene_layer_never_clips() {
         let layers = layers(&["b"]);
         let infos = vec![
             info(1, "a", rect(0, 0, 100, 100)),
             info(2, "b", rect(0, 0, 100, 100)),
         ];
         let v = compute_visibility(&infos, &layers, None);
-        assert!(!v[0].visible);
+        assert!(!v[0].visible, "シーン外は非表示");
         assert_eq!(v[0].reason, None, "シーン外の非表示に reason は付かない");
         assert!(v[1].visible);
+        assert!(v[1].clip.is_empty(), "シーン外の a は occluder にならない");
     }
 
     #[test]
-    fn session_mismatch_takes_precedence_over_occlusion() {
+    fn session_mismatch_hides_and_stops_occluding() {
+        // セッション不一致の上位は非表示 → 下位を clip しない
         let layers = layers(&["a", "b"]);
-        let mut b = info(2, "b", rect(0, 0, 10, 10));
-        b.session = Some("$1");
-        let infos = vec![info(1, "a", rect(0, 0, 10, 10)), b];
+        let mut a = info(1, "a", rect(0, 0, 100, 100));
+        a.session = Some("$1");
+        let infos = vec![a, info(2, "b", rect(0, 0, 100, 100))];
         let v = compute_visibility(&infos, &layers, Some("$0"));
-        assert!(v[0].visible);
-        assert!(!v[1].visible);
-        assert_eq!(v[1].reason.as_deref(), Some("session"));
+        assert!(!v[0].visible);
+        assert_eq!(v[0].reason.as_deref(), Some("session"));
+        assert!(v[1].visible);
+        assert!(v[1].clip.is_empty(), "非表示の a は clip 源にならない");
     }
 
     #[test]
-    fn same_name_later_connection_wins() {
+    fn same_name_later_connection_clips_earlier() {
         let layers = layers(&["a"]);
         let infos = vec![
             info(1, "a", rect(0, 0, 10, 10)),
             info(2, "a", rect(0, 0, 10, 10)),
         ];
         let v = compute_visibility(&infos, &layers, None);
-        assert!(!v[0].visible);
-        assert!(v[1].visible, "同名レイヤーは後着が上");
+        // 後着 (#2) が上位。先着 (#1) は全面 clip される。
+        assert!(v[1].visible && v[1].clip.is_empty());
+        assert!(v[0].visible);
+        assert_eq!(v[0].clip, vec![r(0, 0, 10, 10)]);
     }
 
     #[test]
-    fn rect_edge_touching_is_not_overlap() {
-        let a = Rect { x: 0, y: 0, w: 50, h: 50 };
-        let b = Rect { x: 50, y: 0, w: 50, h: 50 };
-        assert!(!a.overlaps(&b));
-        let c = Rect { x: 49, y: 49, w: 50, h: 50 };
-        assert!(a.overlaps(&c));
-        let zero = Rect { x: 0, y: 0, w: 0, h: 0 };
-        assert!(!a.overlaps(&zero));
+    fn intersect_computes_overlap_region() {
+        let a = r(0, 0, 50, 50);
+        assert_eq!(a.intersect(&r(50, 0, 50, 50)), None, "辺が接するだけは重ならない");
+        assert_eq!(a.intersect(&r(40, 40, 50, 50)), Some(r(40, 40, 10, 10)));
+        assert_eq!(a.intersect(&r(0, 0, 0, 0)), None, "幅0は重ならない");
+        assert_eq!(a.intersect(&r(10, 10, 20, 20)), Some(r(10, 10, 20, 20)), "内包");
     }
 }
