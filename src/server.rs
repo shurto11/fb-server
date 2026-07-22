@@ -156,7 +156,7 @@ fn compute_visibility(infos: &[LayerInfo], layers: &[String], active: Option<&st
         (layer_index(infos[i].name).unwrap_or(usize::MAX), std::cmp::Reverse(infos[i].id))
     });
 
-    let mut out = vec![Visible { visible: false, reason: None, clip: Vec::new() }; infos.len()];
+    let mut out = vec![Visible { visible: false, reason: None, clip: Vec::new(), scene: None }; infos.len()];
     // 優先度が高い順に処理し、表示中クライアントの rect を積んでいく。
     // 下位クライアントはこの矩形群との重なりを clip として受け取る。
     let mut occluders: Vec<Rect> = Vec::new();
@@ -169,18 +169,19 @@ fn compute_visibility(infos: &[LayerInfo], layers: &[String], active: Option<&st
             _ => true,
         };
         if !in_scene {
-            out[i] = Visible { visible: false, reason: None, clip: Vec::new() };
+            out[i] = Visible { visible: false, reason: None, clip: Vec::new(), scene: None };
             continue;
         }
         if !session_ok {
-            out[i] = Visible { visible: false, reason: Some("session".to_string()), clip: Vec::new() };
+            out[i] =
+                Visible { visible: false, reason: Some("session".to_string()), clip: Vec::new(), scene: None };
             continue;
         }
         let clip: Vec<Rect> = match c.rect {
             Some(r) => occluders.iter().filter_map(|o| o.intersect(&r)).collect(),
             None => Vec::new(),
         };
-        out[i] = Visible { visible: true, reason: None, clip };
+        out[i] = Visible { visible: true, reason: None, clip, scene: None };
         if let Some(r) = c.rect {
             occluders.push(r);
         }
@@ -210,7 +211,10 @@ fn recompute_and_broadcast(shared: &Shared, config: &Config) {
             rect: c.rect,
         })
         .collect();
-    let visibles = compute_visibility(&infos, layers, active.as_deref());
+    let mut visibles = compute_visibility(&infos, layers, active.as_deref());
+    for visible in &mut visibles {
+        visible.scene = Some(scene.clone());
+    }
     for (c, visible) in reg.iter().zip(&visibles) {
         let mut line = serde_json::to_string(visible).unwrap_or_default();
         line.push('\n');

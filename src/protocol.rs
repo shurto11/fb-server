@@ -66,6 +66,11 @@ pub struct Visible {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clip: Vec<Rect>,
+    /// 現在アクティブなシーン名。クライアントが「どのシーンか」で挙動を変える
+    /// ために使う(例: task-var は fbhalf シーンの間だけスワイプ表示モードに
+    /// なる)。判定に使わないクライアントは無視してよい。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene: Option<String>,
 }
 
 /// クライアント → サーバー(hello の後、描画領域が変わるたびに1行送ってよい)。
