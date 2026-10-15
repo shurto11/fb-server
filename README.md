@@ -35,7 +35,7 @@ fb-server serve (デーモン)
 - ソケット: `$XDG_RUNTIME_DIR/fb-server.sock`(無ければ `/tmp/fb-server.sock`)。
   `FB_SERVER_SOCK` で上書き可。
 - クライアント→サーバー(接続直後・1行): `{"hello":"task-var"}`
-  - 任意で tmux セッションIDを申告できる: `{"hello":"ssbrowse","session":"$3"}`
+  - 任意で tmux セッションIDを申告できる: `{"hello":"fbrowse","session":"$3"}`
   - 任意で描画領域(ピクセル座標)を申告できる:
     `{"hello":"spotatui-pip","rect":{"x":800,"y":0,"w":224,"h":126}}`
   - 描画領域が動くクライアント(fbhalf の auto 追従など)は、hello の後で
@@ -81,8 +81,8 @@ fb-server serve (デーモン)
 
 `hello` に `session`(tmux の `#{session_id}`、`$0` 形式)を含めたクライアントは、
 シーンによる許可に加えて「その tmux セッションが今表示されているか」の AND で
-visible が決まる。ssbrowse のスクリーンショットを起動したセッションでだけ
-表示し、別セッションへ切り替えたら隠す、という用途に使う。
+visible が決まる。fbrowse を起動したセッションでだけ表示し、別セッションへ
+切り替えたら隠す、という用途に使う。
 
 - fb-server はセッション拘束クライアントが接続している間だけ、500ms ごとに
   `tmux list-clients` でアクティブセッション(複数クライアント時は最後に操作
@@ -108,9 +108,9 @@ cp scenes.toml ~/.config/fb-server/scenes.toml
 ```toml
 default = ["status-bar", "task-var", "touch-claude", "spotatui-pip"]
 
-[scenes.ssbrowse]
+[scenes.fbrowse]
 extends = "default"
-add = ["ssbrowse"]
+add = ["fbrowse"]
 
 [scenes.touch-paint]
 layers = ["status-bar", "task-var", "touch-paint"]
@@ -155,7 +155,7 @@ cargo run --release -- status
 ## 既知の制約
 
 mpv の DRM/TTY 直接描画(dopagaki の動画再生)や外部ディスプレイの DRM 直接出力
-(fbhalf/ssbrowse の `--display` モード)は、fb-server 経由でピクセルを
+(fbhalf の `--display` モード)は、fb-server 経由でピクセルを
 やり取りしているわけではない。fb-server はこれらの描画開始/終了の
 タイミングで排他制御(visible の on/off)を行うだけで、実際の出力経路までは
 関与しない。

@@ -18,9 +18,9 @@
 
 default = ["status-bar", "task-var", "spotatui-pip"]
 
-[scenes.ssbrowse]
+[scenes.fbrowse]
 extends = "default"
-add = ["ssbrowse"]
+add = ["fbrowse"]
 
 [scenes.fbhalf]
 extends = "default"

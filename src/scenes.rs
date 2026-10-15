@@ -4,9 +4,9 @@
 //! ```toml
 //! default = ["status-bar", "task-var"]
 //!
-//! [scenes.ssbrowse]
+//! [scenes.fbrowse]
 //! extends = "default"
-//! add = ["ssbrowse"]
+//! add = ["fbrowse"]
 //!
 //! [scenes.touch-paint]
 //! layers = ["status-bar", "task-var", "touch-paint"]
@@ -131,9 +131,9 @@ mod tests {
     const SAMPLE: &str = r#"
 default = ["status-bar", "task-var", "touch-claude", "spotatui-pip"]
 
-[scenes.ssbrowse]
+[scenes.fbrowse]
 extends = "default"
-add = ["ssbrowse"]
+add = ["fbrowse"]
 
 [scenes.fbhalf]
 extends = "default"
@@ -163,8 +163,8 @@ layers = ["task-var", "tmux-session"]
     fn extends_add_appends_to_default() {
         let cfg = Config::parse(SAMPLE).unwrap();
         assert_eq!(
-            cfg.layers_for("ssbrowse"),
-            &["status-bar", "task-var", "touch-claude", "spotatui-pip", "ssbrowse"]
+            cfg.layers_for("fbrowse"),
+            &["status-bar", "task-var", "touch-claude", "spotatui-pip", "fbrowse"]
         );
     }
 
