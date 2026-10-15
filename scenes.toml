@@ -16,7 +16,7 @@
 # 描画する(領域全体は隠れない)。`extends + add` の追加分は末尾に付くので、
 # 追加レイヤーは継承元より優先度が低くなる点に注意。
 
-default = ["status-bar", "task-var", "touch-claude", "spotatui-pip"]
+default = ["status-bar", "task-var", "spotatui-pip"]
 
 [scenes.ssbrowse]
 extends = "default"
