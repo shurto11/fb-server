@@ -63,7 +63,7 @@ impl Config {
         Self::parse(&text)
     }
 
-    fn parse(text: &str) -> Result<Self> {
+    pub(crate) fn parse(text: &str) -> Result<Self> {
         let raw: RawConfig = toml::from_str(text).context("scenes.toml のパースに失敗")?;
         let mut resolved: HashMap<String, Vec<String>> = HashMap::new();
         resolved.insert("default".to_string(), raw.default.clone());

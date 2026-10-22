@@ -14,6 +14,10 @@ use serde::{Deserialize, Serialize};
 /// セッションがアクティブ(いずれかの tmux クライアントが表示中)な間だけ
 /// visible=true になる(シーンによる許可との AND)。
 ///
+/// `pane` は任意の tmux ペインID(`$TMUX_PANE`、`%0` 形式)。指定すると、その
+/// ペインがアクティブセッションのカレントウィンドウにある間だけ visible=true に
+/// なる(`session` より細かいウィンドウ単位の拘束。両方あれば `pane` を優先)。
+///
 /// `rect` は任意の描画領域(フレームバッファ上のピクセル座標)。申告すると
 /// 重なり調停の対象になる: シーンのレイヤー一覧で自分より前(= 優先度が高い)
 /// の表示中クライアントと矩形が重なると、その重なり領域が `clip`(描画禁止
@@ -24,6 +28,8 @@ pub struct Hello {
     pub hello: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rect: Option<Rect>,
 }
@@ -50,9 +56,10 @@ impl Rect {
 }
 
 /// サーバー → クライアント。今表示してよいか。
-/// `reason` は visible=false の理由。`"session"` はシーン上は許可されている
-/// がセッション不一致で隠された場合(クライアントはクリア後にターミナルの
-/// 再描画を要求してよい)。それ以外(シーンによる非許可)では省略される。
+/// `reason` は visible=false の理由。`"session"` は申告したセッション/ペインが
+/// tmux 上で今表示されていないため隠された場合(クライアントはクリア後に
+/// ターミナルの再描画を要求してよい)。それ以外(シーンによる非許可)では
+/// 省略される。
 ///
 /// `clip` は描画禁止矩形のリスト(フレームバッファ絶対座標)。自分より優先度が
 /// 高い表示中クライアントが占める、自分の rect と重なる領域。visible=true でも

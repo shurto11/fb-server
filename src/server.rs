@@ -3,8 +3,11 @@
 //!
 //! hello で tmux セッションID (`session`) を申告したクライアントは、その
 //! セッションがアクティブな間だけ visible=true になる(シーン許可との AND)。
-//! アクティブセッションはセッション拘束クライアントが居る間だけ tmux を
-//! ポーリングして追跡する。
+//! tmux ペインID (`pane`) を申告すると、さらにそのペインがアクティブセッションの
+//! カレントウィンドウにある間だけに絞られる(ウィンドウ単位の拘束)。
+//! tmux の表示状態は拘束クライアントが居る間だけポーリングして追跡する。
+//! シーンも今表示されているクライアントから決めるので、別ウィンドウに隠れた
+//! fbhalf のシーンが居座って表示中ウィンドウの fbrowse を隠すことはない。
 //!
 //! hello で描画領域 (`rect`) を申告したクライアント同士は重なりを調停する:
 //! シーンのレイヤー一覧の並びが優先度(先頭が最上位)で、優先度の高い表示中
@@ -30,16 +33,41 @@ struct Client {
     name: String,
     /// hello で申告された tmux セッションID(`$0` 形式)。None なら無条件。
     session: Option<String>,
+    /// hello で申告された tmux ペインID(`%0` 形式)。None ならウィンドウ単位の
+    /// 拘束なし。
+    pane: Option<String>,
     /// hello で申告された描画領域。None なら重なり調停に参加しない。
     rect: Option<Rect>,
     write: UnixStream,
 }
 
+/// tmux で今画面に出ているもの。
+#[derive(Clone, Debug, PartialEq)]
+struct TmuxView {
+    /// tmux クライアントが今表示しているセッションID。
+    session: String,
+    /// そのセッションのカレントウィンドウにあるペインID。
+    panes: HashSet<String>,
+}
+
+/// session/pane を申告したクライアントが今画面に出ているか。pane があれば
+/// そのペインがカレントウィンドウにあるか、session だけならそのセッションが
+/// アクティブか。tmux の状態が不明 (`view` が None) なら拘束を適用しない
+/// (フェイルオープン)。
+fn is_shown(view: Option<&TmuxView>, session: Option<&str>, pane: Option<&str>) -> bool {
+    let Some(view) = view else { return true };
+    match (pane, session) {
+        (Some(p), _) => view.panes.contains(p),
+        (None, Some(s)) => view.session == s,
+        (None, None) => true,
+    }
+}
+
 struct Shared {
     clients: Mutex<Vec<Client>>,
-    /// tmux クライアントが今表示しているセッションID。取得できない間は None
-    /// (None の間はセッション拘束を適用しない = フェイルオープン)。
-    active_session: Mutex<Option<String>>,
+    /// tmux で今表示されているセッション/ウィンドウ。取得できない間は None
+    /// (None の間はセッション/ペイン拘束を適用しない = フェイルオープン)。
+    view: Mutex<Option<TmuxView>>,
 }
 
 pub fn serve() -> Result<()> {
@@ -56,14 +84,14 @@ pub fn serve() -> Result<()> {
 
     let shared = Arc::new(Shared {
         clients: Mutex::new(Vec::new()),
-        active_session: Mutex::new(None),
+        view: Mutex::new(None),
     });
     let ids = AtomicU64::new(1);
 
     {
         let shared = shared.clone();
         let config = config.clone();
-        thread::spawn(move || watch_active_session(shared, config));
+        thread::spawn(move || watch_tmux_view(shared, config));
     }
 
     for stream in listener.incoming() {
@@ -76,35 +104,53 @@ pub fn serve() -> Result<()> {
     Ok(())
 }
 
-/// tmux クライアントが今表示しているセッションIDを返す。複数クライアントが
-/// 居る場合は最後に操作されたもの(client_activity 最大)を採用する。
-fn query_active_session() -> Option<String> {
+/// tmux クライアントが今表示しているセッションと、そのカレントウィンドウの
+/// ペインを返す。複数クライアントが居る場合は最後に操作されたもの
+/// (client_activity 最大)のセッションを採用する。
+fn query_view() -> Option<TmuxView> {
     let out = crate::tmux::capture(&["list-clients", "-F", "#{client_activity} #{session_id}"]);
-    out.lines()
+    let session = out
+        .lines()
         .filter_map(|l| {
             let mut it = l.split_whitespace();
             let activity: u64 = it.next()?.parse().ok()?;
             Some((activity, it.next()?.to_string()))
         })
         .max_by_key(|(activity, _)| *activity)
-        .map(|(_, sid)| sid)
+        .map(|(_, sid)| sid)?;
+    // -t にセッションを渡すと、そのカレントウィンドウのペインが並ぶ
+    let panes: HashSet<String> = crate::tmux::capture(&["list-panes", "-t", &session, "-F", "#{pane_id}"])
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    // ウィンドウには必ずペインがあるので、空なら取得失敗(直後に消えた等)とみなす
+    if panes.is_empty() {
+        return None;
+    }
+    Some(TmuxView { session, panes })
 }
 
-/// セッション拘束クライアントが接続している間、アクティブセッションを
-/// ポーリングし、切り替わったら visible を再配信する。
-fn watch_active_session(shared: Arc<Shared>, config: Arc<Config>) {
+/// セッション/ペイン拘束クライアントが接続している間、tmux の表示状態を
+/// ポーリングし、セッションやウィンドウが切り替わったら visible を再配信する。
+fn watch_tmux_view(shared: Arc<Shared>, config: Arc<Config>) {
     loop {
         thread::sleep(Duration::from_millis(500));
-        let bound = shared.clients.lock().unwrap().iter().any(|c| c.session.is_some());
+        let bound = shared
+            .clients
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.session.is_some() || c.pane.is_some());
         if !bound {
             // 誰も拘束されていない間は tmux を叩かない。次の拘束クライアント
             // 接続時に古い値で判定しないよう None に戻しておく。
-            *shared.active_session.lock().unwrap() = None;
+            *shared.view.lock().unwrap() = None;
             continue;
         }
-        let now = query_active_session();
+        let now = query_view();
         let changed = {
-            let mut cur = shared.active_session.lock().unwrap();
+            let mut cur = shared.view.lock().unwrap();
             if *cur != now {
                 *cur = now;
                 true
@@ -118,38 +164,55 @@ fn watch_active_session(shared: Arc<Shared>, config: Arc<Config>) {
     }
 }
 
-/// 現在のシーン名を決める: レイヤー名が scenes.toml の `[scenes.X]` と一致する
-/// クライアントのうち、最後に接続したもの。無ければ `"default"`。
-fn current_scene(reg: &[Client], config: &Config) -> String {
-    let scene_names: HashSet<&str> = config.scene_names().collect();
-    reg.iter()
-        .rev()
-        .find(|c| scene_names.contains(c.name.as_str()))
-        .map(|c| c.name.clone())
-        .unwrap_or_else(|| "default".to_string())
-}
-
 /// visible 判定に使うクライアント情報(`Client` から UnixStream を除いたもの)。
 struct LayerInfo<'a> {
     id: u64,
     name: &'a str,
     session: Option<&'a str>,
+    pane: Option<&'a str>,
     rect: Option<Rect>,
+}
+
+fn layer_infos(reg: &[Client]) -> Vec<LayerInfo<'_>> {
+    reg.iter()
+        .map(|c| LayerInfo {
+            id: c.id,
+            name: c.name.as_str(),
+            session: c.session.as_deref(),
+            pane: c.pane.as_deref(),
+            rect: c.rect,
+        })
+        .collect()
+}
+
+/// 現在のシーン名を決める: レイヤー名が scenes.toml の `[scenes.X]` と一致し、
+/// tmux 上で今表示されている(拘束なしを含む)クライアントのうち、最後に接続した
+/// もの。無ければ `"default"`。別ウィンドウ/セッションに隠れたクライアントの
+/// シーンが居座り、表示中ウィンドウのクライアントを隠してしまうのを防ぐ。
+fn current_scene(infos: &[LayerInfo], config: &Config, view: Option<&TmuxView>) -> String {
+    let scene_names: HashSet<&str> = config.scene_names().collect();
+    infos
+        .iter()
+        .rev()
+        .find(|c| scene_names.contains(c.name) && is_shown(view, c.session, c.pane))
+        .map(|c| c.name.to_string())
+        .unwrap_or_else(|| "default".to_string())
 }
 
 /// 全クライアントの visible を計算する。`infos` と同じ順で返す。
 ///
 /// 判定:
-/// 1. シーン許可: 名前が `layers` に含まれるか。無ければ visible=false。
-/// 2. セッション拘束: 申告セッションがアクティブセッションと一致するか
-///    (どちらかが不明なら適用しない = フェイルオープン)。不一致なら
-///    visible=false, reason="session"。
+/// 1. tmux 拘束: 申告したセッション/ペインが今表示されているか
+///    (`is_shown`。tmux の状態が不明なら適用しない = フェイルオープン)。
+///    表示されていなければ visible=false, reason="session"。tmux 側の画面が
+///    切り替わった結果なので、クライアントはクリア後に再描画を要求してよい。
+/// 2. シーン許可: 名前が `layers` に含まれるか。無ければ visible=false。
 /// 3. 重なり調停(クリップ): `layers` の並びを優先度(先頭が最上位)とし、rect を
 ///    申告したクライアントは visible=true のまま、自分より優先度が高い表示中
 ///    クライアントの rect と重なる領域を `clip`(描画禁止矩形)として受け取る。
 ///    クライアントはその矩形を避けて描くのでチカチカしない。同名クライアント
 ///    同士は後着が上。rect 未申告のクライアントは調停に参加しない(clip 空)。
-fn compute_visibility(infos: &[LayerInfo], layers: &[String], active: Option<&str>) -> Vec<Visible> {
+fn compute_visibility(infos: &[LayerInfo], layers: &[String], view: Option<&TmuxView>) -> Vec<Visible> {
     let layer_index = |name: &str| layers.iter().position(|l| l == name);
     let mut order: Vec<usize> = (0..infos.len()).collect();
     order.sort_by_key(|&i| {
@@ -162,19 +225,13 @@ fn compute_visibility(infos: &[LayerInfo], layers: &[String], active: Option<&st
     let mut occluders: Vec<Rect> = Vec::new();
     for &i in &order {
         let c = &infos[i];
-        let in_scene = layer_index(c.name).is_some();
-        // active_session が取れない間 (tmux 不在等) はセッション拘束を適用しない
-        let session_ok = match (c.session, active) {
-            (Some(cs), Some(a)) => cs == a,
-            _ => true,
-        };
-        if !in_scene {
-            out[i] = Visible { visible: false, reason: None, clip: Vec::new(), scene: None };
-            continue;
-        }
-        if !session_ok {
+        if !is_shown(view, c.session, c.pane) {
             out[i] =
                 Visible { visible: false, reason: Some("session".to_string()), clip: Vec::new(), scene: None };
+            continue;
+        }
+        if layer_index(c.name).is_none() {
+            out[i] = Visible { visible: false, reason: None, clip: Vec::new(), scene: None };
             continue;
         }
         let clip: Vec<Rect> = match c.rect {
@@ -193,25 +250,17 @@ fn compute_visibility(infos: &[LayerInfo], layers: &[String], active: Option<&st
 /// あわせて `status-bar` レイヤーの有無に応じて tmux のステータス行を切り替える。
 fn recompute_and_broadcast(shared: &Shared, config: &Config) {
     let reg = shared.clients.lock().unwrap();
-    let active = shared.active_session.lock().unwrap().clone();
-    let scene = current_scene(&reg, config);
+    let view = shared.view.lock().unwrap().clone();
+    let infos = layer_infos(&reg);
+    let scene = current_scene(&infos, config, view.as_ref());
     let layers = config.layers_for(&scene);
 
     eprintln!(
-        "[fb-server] scene={scene} layers={layers:?} active_session={active:?} clients={:?}",
+        "[fb-server] scene={scene} layers={layers:?} view={view:?} clients={:?}",
         reg.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()
     );
 
-    let infos: Vec<LayerInfo> = reg
-        .iter()
-        .map(|c| LayerInfo {
-            id: c.id,
-            name: c.name.as_str(),
-            session: c.session.as_deref(),
-            rect: c.rect,
-        })
-        .collect();
-    let mut visibles = compute_visibility(&infos, layers, active.as_deref());
+    let mut visibles = compute_visibility(&infos, layers, view.as_ref());
     for visible in &mut visibles {
         visible.scene = Some(scene.clone());
     }
@@ -246,13 +295,17 @@ fn handle_client(id: u64, stream: UnixStream, shared: Arc<Shared>, config: Arc<C
 
     if hello.hello == STATUS_QUERY_NAME {
         let reg = shared.clients.lock().unwrap();
-        let scene = current_scene(&reg, &config);
+        let view = shared.view.lock().unwrap().clone();
+        let scene = current_scene(&layer_infos(&reg), &config, view.as_ref());
         let clients = reg
             .iter()
             .map(|c| {
                 let mut s = c.name.clone();
                 if let Some(sess) = &c.session {
                     s.push_str(&format!(" (session {sess})"));
+                }
+                if let Some(pane) = &c.pane {
+                    s.push_str(&format!(" (pane {pane})"));
                 }
                 if let Some(r) = &c.rect {
                     s.push_str(&format!(" [{}x{}+{}+{}]", r.w, r.h, r.x, r.y));
@@ -261,8 +314,7 @@ fn handle_client(id: u64, stream: UnixStream, shared: Arc<Shared>, config: Arc<C
             })
             .collect();
         drop(reg);
-        let active_session = shared.active_session.lock().unwrap().clone();
-        let reply = StatusReply { scene, clients, active_session };
+        let reply = StatusReply { scene, clients, active_session: view.map(|v| v.session) };
         let mut out = serde_json::to_string(&reply).unwrap_or_default();
         out.push('\n');
         let _ = (&stream).write_all(out.as_bytes());
@@ -270,21 +322,22 @@ fn handle_client(id: u64, stream: UnixStream, shared: Arc<Shared>, config: Arc<C
     }
 
     eprintln!(
-        "[fb-server] + client #{id} name={} session={:?} rect={:?}",
-        hello.hello, hello.session, hello.rect
+        "[fb-server] + client #{id} name={} session={:?} pane={:?} rect={:?}",
+        hello.hello, hello.session, hello.pane, hello.rect
     );
-    let bound = hello.session.is_some();
+    let bound = hello.session.is_some() || hello.pane.is_some();
     shared.clients.lock().unwrap().push(Client {
         id,
         name: hello.hello.clone(),
         session: hello.session,
+        pane: hello.pane,
         rect: hello.rect,
         write: stream,
     });
-    // セッション拘束クライアントの初回判定をポーリングを待たずに行う
+    // 拘束クライアントの初回判定をポーリングを待たずに行う
     if bound {
-        let now = query_active_session();
-        *shared.active_session.lock().unwrap() = now;
+        let now = query_view();
+        *shared.view.lock().unwrap() = now;
     }
     recompute_and_broadcast(&shared, &config);
 
@@ -332,11 +385,30 @@ mod tests {
     }
 
     fn info(id: u64, name: &str, rect: Option<Rect>) -> LayerInfo<'_> {
-        LayerInfo { id, name, session: None, rect }
+        LayerInfo { id, name, session: None, pane: None, rect }
     }
 
     fn r(x: u32, y: u32, w: u32, h: u32) -> Rect {
         Rect { x, y, w, h }
+    }
+
+    fn view(session: &str, panes: &[&str]) -> TmuxView {
+        TmuxView { session: session.to_string(), panes: panes.iter().map(|p| p.to_string()).collect() }
+    }
+
+    fn config() -> Config {
+        Config::parse(
+            r#"
+default = ["status-bar", "task-var"]
+
+[scenes.fbrowse]
+add = ["fbrowse"]
+
+[scenes.fbhalf]
+add = ["fbhalf"]
+"#,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -429,11 +501,71 @@ mod tests {
         let mut a = info(1, "a", rect(0, 0, 100, 100));
         a.session = Some("$1");
         let infos = vec![a, info(2, "b", rect(0, 0, 100, 100))];
-        let v = compute_visibility(&infos, &layers, Some("$0"));
+        let v = compute_visibility(&infos, &layers, Some(&view("$0", &["%0"])));
         assert!(!v[0].visible);
         assert_eq!(v[0].reason.as_deref(), Some("session"));
         assert!(v[1].visible);
         assert!(v[1].clip.is_empty(), "非表示の a は clip 源にならない");
+    }
+
+    #[test]
+    fn pane_outside_current_window_is_hidden() {
+        let layers = layers(&["a"]);
+        let mut a = info(1, "a", None);
+        a.session = Some("$0");
+        a.pane = Some("%5");
+        let infos = vec![a];
+        // 同じセッションでも、ペインがカレントウィンドウに無ければ隠す
+        let v = compute_visibility(&infos, &layers, Some(&view("$0", &["%1", "%2"])));
+        assert!(!v[0].visible);
+        assert_eq!(v[0].reason.as_deref(), Some("session"));
+        let v = compute_visibility(&infos, &layers, Some(&view("$0", &["%5"])));
+        assert!(v[0].visible);
+    }
+
+    #[test]
+    fn unknown_tmux_view_fails_open() {
+        let layers = layers(&["a"]);
+        let mut a = info(1, "a", None);
+        a.session = Some("$0");
+        a.pane = Some("%5");
+        let v = compute_visibility(&[a], &layers, None);
+        assert!(v[0].visible);
+    }
+
+    #[test]
+    fn scene_follows_client_in_current_window() {
+        // fbrowse を開いたウィンドウ(%1)と、後から fbhalf を開いたウィンドウ(%2)
+        let cfg = config();
+        let mut fbrowse = info(1, "fbrowse", None);
+        fbrowse.pane = Some("%1");
+        let mut fbhalf = info(2, "fbhalf", None);
+        fbhalf.pane = Some("%2");
+        let infos = vec![fbrowse, fbhalf];
+
+        // fbhalf のウィンドウを表示中: 後着の fbhalf がシーンを取る
+        let on_fbhalf = view("$0", &["%2"]);
+        assert_eq!(current_scene(&infos, &cfg, Some(&on_fbhalf)), "fbhalf");
+
+        // fbrowse のウィンドウへ切り替え: 隠れた fbhalf ではなく fbrowse のシーンになる
+        let on_fbrowse = view("$0", &["%1"]);
+        let scene = current_scene(&infos, &cfg, Some(&on_fbrowse));
+        assert_eq!(scene, "fbrowse");
+        let v = compute_visibility(&infos, cfg.layers_for(&scene), Some(&on_fbrowse));
+        assert!(v[0].visible, "表示中ウィンドウの fbrowse は見える");
+        assert!(!v[1].visible);
+        assert_eq!(v[1].reason.as_deref(), Some("session"));
+    }
+
+    #[test]
+    fn scene_falls_back_to_default_when_scene_clients_are_hidden() {
+        let cfg = config();
+        let mut fbhalf = info(1, "fbhalf", None);
+        fbhalf.pane = Some("%2");
+        let infos = vec![info(2, "task-var", None), fbhalf];
+        assert_eq!(current_scene(&infos, &cfg, Some(&view("$0", &["%9"]))), "default");
+        // tmux の状態が不明なら従来通り後着のシーン
+        assert_eq!(current_scene(&infos, &cfg, None), "fbhalf");
     }
 
     #[test]
