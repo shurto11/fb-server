@@ -35,3 +35,7 @@ layers = ["status-bar", "task-var", "touch-paint"]
 
 [scenes.tmux-session]
 layers = ["tmux-session"]
+
+# fbcam (~/ssd/apps/fbcam): 全画面のカメラビュー。ステータスバー・タスクバーも隠す排他シーン
+[scenes.fbcam]
+layers = ["fbcam"]
