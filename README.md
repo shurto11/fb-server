@@ -108,13 +108,17 @@ fbhalf と fbrowse を別ウィンドウで開いておき、ウィンドウを�
 ## シーン定義 (scenes.toml)
 
 `$FB_SERVER_CONFIG` > `$XDG_CONFIG_HOME/fb-server/scenes.toml` >
-`~/.config/fb-server/scenes.toml` の順に探す。まずリポジトリ同梱の
-[`scenes.toml`](./scenes.toml) をコピーする:
+`~/.config/fb-server/scenes.toml` の順に探す。設定の正本はリポジトリの
+[`scenes.toml`](./scenes.toml) で、`~/.config` 側はそこへのシンボリックリンク
+にする(コピーすると2か所に分かれて内容がずれるため)。シーンの追加・変更は
+リポジトリの `scenes.toml` を直接編集してコミットする:
 
 ```sh
 mkdir -p ~/.config/fb-server
-cp scenes.toml ~/.config/fb-server/scenes.toml
+ln -sf "$PWD/scenes.toml" ~/.config/fb-server/scenes.toml
 ```
+
+設定は `serve` 起動時に1回だけ読むので、編集後は fb-server を再起動する。
 
 フォーマット:
 
@@ -157,7 +161,7 @@ cargo run --release -- status
 - `src/server.rs` — 接続管理・シーン判定・`visible` 配信・ステータスバー切替
 - `src/tmux.rs` — tmux コマンド実行の共通ヘルパ([touch-server](../touch/touch-server)
   と共通)
-- `scenes.toml` — シーン定義のサンプル(このリポジトリの `design.md` の表を反映)
+- `scenes.toml` — シーン定義の正本(`~/.config/fb-server/scenes.toml` からリンクして使う)
 
 ## クライアント側の実装
 
